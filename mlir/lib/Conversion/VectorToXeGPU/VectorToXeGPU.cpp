@@ -14,6 +14,7 @@
 #include "mlir/Conversion/VectorToGPU/VectorToGPU.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
@@ -569,13 +570,14 @@ struct TransferReadLowering : public OpRewritePattern<vector::TransferReadOp> {
     // Prefer an nd block load. It requires HW block-load support, a vector of
     // rank >= 2 backed by a scalar-element memref, and a map the block load can
     // realize. 1D vectors use the scattered xegpu.load path instead, which has
-    // a richer interface (e.g. layout capabilities). Out-of-bounds reads are
-    // allowed as long as the padding matches load_nd's implicit zero padding.
-    bool canLowerToLoadNd =
-        hasBlockLoadSupport && loadedVecTy.getRank() > 1 &&
-        (readMap.isMinorIdentity() || isTransposeLoad) &&
-        readMemTy.getElementType().isIntOrFloat() &&
-        (!isOutOfBounds || isZeroOrPoisonPadding(readOp.getPadding()));
+    // a richer interface (e.g. layout capabilities).
+    bool canLowerToLoadNd = hasBlockLoadSupport && loadedVecTy.getRank() > 1 &&
+                            (readMap.isMinorIdentity() || isTransposeLoad) &&
+                            readMemTy.getElementType().isIntOrFloat();
+
+    bool needsCustomPadding =
+        canLowerToLoadNd && isOutOfBounds &&
+        !(readOp.getPadding() && isZeroOrPoisonPadding(readOp.getPadding()));
 
     if (canLowerToLoadNd) {
       auto elementType = loadedVecTy.getElementType();
@@ -616,6 +618,32 @@ struct TransferReadLowering : public OpRewritePattern<vector::TransferReadOp> {
         loadedOp = vector::TransposeOp::create(rewriter, loc,
                                                loadedOp->getResult(0), perm);
       }
+
+      if (needsCustomPadding) {
+        VectorType resVecTy = readOp.getVectorType();
+        SmallVector<OpFoldResult> srcSizes =
+            memref::getMixedSizes(rewriter, loc, readOp.getBase());
+        ValueRange readIndices = readOp.getIndices();
+
+        SmallVector<Value> maskBounds;
+        maskBounds.reserve(resVecTy.getRank());
+        for (AffineExpr expr : readMap.getResults()) {
+          unsigned pos = cast<AffineDimExpr>(expr).getPosition();
+          Value dim =
+              getValueOrCreateConstantIndexOp(rewriter, loc, srcSizes[pos]);
+          maskBounds.push_back(
+              rewriter.createOrFold<arith::SubIOp>(loc, dim, readIndices[pos]));
+        }
+
+        auto maskTy = resVecTy.cloneWith(/*shape=*/{}, rewriter.getI1Type());
+        Value mask =
+            vector::CreateMaskOp::create(rewriter, loc, maskTy, maskBounds);
+        Value padSplat = vector::BroadcastOp::create(rewriter, loc, resVecTy,
+                                                     readOp.getPadding());
+        loadedOp = arith::SelectOp::create(rewriter, loc, mask,
+                                           loadedOp->getResult(0), padSplat);
+      }
+
       rewriter.replaceOp(readOp, loadedOp);
       return success();
     }

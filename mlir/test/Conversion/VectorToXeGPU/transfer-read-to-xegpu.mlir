@@ -401,18 +401,59 @@ gpu.func @load_transpose_f16(%source: memref<32x64xf16>,
 
 // -----
 gpu.module @xevm_module {
-gpu.func @no_load_out_of_bounds_non_zero_pad(%source: memref<32x64xf32>,
-    %offset: index, %arg2: index, %pad: f32) -> (vector<8x16xf32>, vector<8x16xf32>) {
+gpu.func @load_out_of_bounds_non_zero_pad(%source: memref<32x64xf32>,
+    %offset: index, %arg2: index) -> vector<8x16xf32> {
   %c1 = arith.constant 1.0 : f32
   %0 = vector.transfer_read %source[%offset, %arg2], %c1
     {in_bounds = [true, false]} : memref<32x64xf32>, vector<8x16xf32>
-  %1 = vector.transfer_read %source[%arg2, %offset], %pad
-    {in_bounds = [false, true]} : memref<32x64xf32>, vector<8x16xf32>
-  gpu.return %0, %1 : vector<8x16xf32>, vector<8x16xf32>
+  gpu.return %0 : vector<8x16xf32>
 }
 
-// CHECK-LABEL: @no_load_out_of_bounds_non_zero_pad(
-// CHECK-COUNT-2: vector.transfer_read
+// LOAD-ND-LABEL:  @load_out_of_bounds_non_zero_pad(
+// LOAD-ND-SAME:   %[[SRC:.+]]: memref<32x64xf32>,
+// LOAD-ND-SAME:   %[[OFFSET:.+]]: index,
+// LOAD-ND-SAME:   %[[ARG2:.+]]: index
+// LOAD-ND-DAG:    %[[PAD:.+]] = arith.constant dense<1.000000e+00> : vector<8x16xf32>
+// LOAD-ND-DAG:    %[[D0:.+]] = arith.constant 32 : index
+// LOAD-ND-DAG:    %[[D1:.+]] = arith.constant 64 : index
+// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[SRC]]
+// LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFFSET]], %[[ARG2]]]{{.*}}-> vector<8x16xf32>
+// LOAD-ND-DAG:    %[[B0:.+]] = arith.subi %[[D0]], %[[OFFSET]] : index
+// LOAD-ND-DAG:    %[[B1:.+]] = arith.subi %[[D1]], %[[ARG2]] : index
+// LOAD-ND:        %[[MASK:.+]] = vector.create_mask %[[B0]], %[[B1]] : vector<8x16xi1>
+// LOAD-ND:        %[[RES:.+]] = arith.select %[[MASK]], %[[VEC]], %[[PAD]] : vector<8x16xi1>, vector<8x16xf32>
+// LOAD-ND:        return %[[RES]]
+
+// The scattered path still declines an out-of-bounds read.
+// LOAD-GATHER-LABEL:  @load_out_of_bounds_non_zero_pad(
+// LOAD-GATHER:        vector.transfer_read
+}
+
+// -----
+gpu.module @xevm_module {
+gpu.func @load_out_of_bounds_dynamic_pad(%source: memref<32x64xf32>,
+    %offset: index, %arg2: index, %pad: f32) -> vector<8x16xf32> {
+  %0 = vector.transfer_read %source[%arg2, %offset], %pad
+    {in_bounds = [false, true]} : memref<32x64xf32>, vector<8x16xf32>
+  gpu.return %0 : vector<8x16xf32>
+}
+
+// LOAD-ND-LABEL:  @load_out_of_bounds_dynamic_pad(
+// LOAD-ND-SAME:   %[[SRC:.+]]: memref<32x64xf32>,
+// LOAD-ND-SAME:   %[[OFFSET:.+]]: index, %[[ARG2:.+]]: index,
+// LOAD-ND-SAME:   %[[PAD:.+]]: f32
+// LOAD-ND-DAG:    %[[D0:.+]] = arith.constant 32 : index
+// LOAD-ND-DAG:    %[[D1:.+]] = arith.constant 64 : index
+// LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %{{.*}}[%[[ARG2]], %[[OFFSET]]]{{.*}}-> vector<8x16xf32>
+// LOAD-ND-DAG:    %[[B0:.+]] = arith.subi %[[D0]], %[[ARG2]] : index
+// LOAD-ND-DAG:    %[[B1:.+]] = arith.subi %[[D1]], %[[OFFSET]] : index
+// LOAD-ND:        %[[MASK:.+]] = vector.create_mask %[[B0]], %[[B1]] : vector<8x16xi1>
+// LOAD-ND:        %[[SPLAT:.+]] = vector.broadcast %[[PAD]] : f32 to vector<8x16xf32>
+// LOAD-ND:        %[[RES:.+]] = arith.select %[[MASK]], %[[VEC]], %[[SPLAT]] : vector<8x16xi1>, vector<8x16xf32>
+// LOAD-ND:        return %[[RES]]
+
+// LOAD-GATHER-LABEL:  @load_out_of_bounds_dynamic_pad(
+// LOAD-GATHER:        vector.transfer_read
 }
 
 // -----
